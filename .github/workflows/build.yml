@@ -1,0 +1,33 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags:     ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+      - name: Build EXE
+        run: pyinstaller --onefile --noconsole --name "ClipMarker" --icon=icon.ico --collect-all easyocr --hidden-import=easyocr --hidden-import=pygame --hidden-import=cv2 app.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClipMarker-Windows
+          path: dist/ClipMarker.exe
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ClipMarker ${{ github.ref_name }}"
+          prerelease: ${{ contains(github.ref_name, 'beta') }}
+          files: dist/ClipMarker.exe
