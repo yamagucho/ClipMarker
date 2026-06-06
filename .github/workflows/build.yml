@@ -9,6 +9,10 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: clip_marker
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
