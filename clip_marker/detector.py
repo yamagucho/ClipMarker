@@ -1,9 +1,16 @@
 """
-detector.py  ─  Kill / event detection core
-Splatoon 2 / 3:
-  - キル: 画面下部中央の「○○をたおした！」黒帯バナーを検出
-    ROI内の暗部比率とフレーム差分の組み合わせで誤検出を抑制
-  - デス: 全画面の急激な暗転（リスポーン暗転）を検出
+detector.py  -  Kill detection via OCR  (Splatoon 2/3)
+
+Primary:  easyocr (pure Python, no external tools)
+          pip install easyocr
+          ~200MB model downloaded on first use.
+          Fires only when "をたおした" is found.
+
+Fallback: pixel-based when easyocr is not installed.
+
+Two-stage pipeline:
+  1. Fast pixel pre-filter (<1ms)  -- skip OCR if no dark banner
+  2. OCR                           -- only when pre-filter passes
 """
 
 import cv2
@@ -11,11 +18,56 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Callable
 
+# ---------------------------------------------------------------------------
+# OCR backend  (lazy-loaded on first use to keep startup fast)
+# ---------------------------------------------------------------------------
+_ocr_reader  = None   # easyocr.Reader, initialised on first OCR call
+_EASYOCR     = False  # True once easyocr import succeeded
+_OCR_READY   = False  # True once reader is loaded and ready
+
+try:
+    import easyocr as _easyocr_mod
+    _EASYOCR = True
+except ImportError:
+    _easyocr_mod = None
+
+KILL_PHRASES = ("をたおした", "たおした")
+
+
+def _ensure_reader(use_gpu: bool = False):
+    """Lazy-init the EasyOCR reader (downloads model on first call)."""
+    global _ocr_reader, _OCR_READY
+    if _OCR_READY:
+        return _ocr_reader
+    if not _EASYOCR:
+        return None
+    try:
+        _ocr_reader = _easyocr_mod.Reader(
+            ["ja"], gpu=use_gpu, verbose=False,
+            model_storage_directory=None,   # use easyocr default cache
+        )
+        _OCR_READY = True
+    except Exception:
+        pass
+    return _ocr_reader
+
+
+def ocr_available() -> bool:
+    return _EASYOCR
+
+
+def ocr_ready() -> bool:
+    return _OCR_READY
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
 
 @dataclass
 class MarkerEvent:
     time_sec: float
-    event_type: str   # "kill", "death", "manual"
+    event_type: str
     confidence: float = 1.0
     label: str = ""
 
@@ -24,148 +76,189 @@ class MarkerEvent:
             self.label = self.event_type
 
 
-# ─── ROI definitions (normalised 0-1)  [x, y, w, h] ─────────────────────────
-
-SPLATOON_ROIS = {
-    # 「○○をたおした！」バナー: 画面下部中央の黒帯
-    # 1920x1080基準: x≈290~1630 (15%~85%), y≈900~1010 (83%~93%)
-    "kill_banner": (0.15, 0.83, 0.70, 0.10),
-
-    # デス検出用: 画面中央の広めの領域
-    "death_zone":  (0.25, 0.25, 0.50, 0.50),
-}
+# Kill banner ROI (normalised 0-1): bottom-centre strip
+KILL_ROI = (0.22, 0.88, 0.54, 0.09)
 
 
-def _crop_roi(frame: np.ndarray, roi: tuple) -> np.ndarray:
+def _crop(frame, roi):
     h, w = frame.shape[:2]
-    x  = int(roi[0] * w)
-    y  = int(roi[1] * h)
-    rw = int(roi[2] * w)
-    rh = int(roi[3] * h)
+    x  = int(roi[0] * w);  y  = int(roi[1] * h)
+    rw = int(roi[2] * w);  rh = int(roi[3] * h)
     return frame[y:y+rh, x:x+rw]
 
 
-def _gray(frame: np.ndarray) -> np.ndarray:
+def _gray(frame):
     return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
+# ---------------------------------------------------------------------------
+# Detector
+# ---------------------------------------------------------------------------
+
 class SplatoonDetector:
     """
-    フレームを順番に feed() に渡すと list[MarkerEvent] を返す。
-    空リストのときはイベントなし。
+    Kill detection from the 'XX wo taoshita!' banner.
 
-    キル検出アルゴリズム:
-      1. kill_banner ROI を切り出す
-      2. 暗部比率 (輝度<50のピクセル割合) を計算
-         → バナー出現時は黒背景が大半を占めるため 0.55 以上になる
-      3. 前フレームとのフレーム差分平均を計算
-         → バナーが新たに出現したフレームで大きな差分が生じる
-      4. 両条件を AND で判定 + クールダウン
+    Pipeline:
+      stage 1 (fast):  dark-ratio pre-filter on thumbnail (<1 ms)
+      stage 2 (OCR):   easyocr on upscaled ROI (fires only on text match)
+      fallback:        pixel bright-text ratio when easyocr unavailable
     """
 
     def __init__(
         self,
-        kill_dark_ratio: float = 0.55,    # バナー内の暗部ピクセル比率閾値
-        kill_diff_threshold: float = 12.0, # フレーム差分の閾値（出現タイミング検出）
-        death_dark_threshold: float = 30.0,# デス検出: 輝度ドロップ量
-        cooldown_sec: float = 3.0,
+        kill_dark_ratio:   float = 0.45,
+        kill_bright_ratio: float = 0.03,
+        cooldown_sec:      float = 3.0,
+        use_gpu:           bool  = False,
     ):
-        self.kill_dark_ratio     = kill_dark_ratio
-        self.kill_diff_threshold = kill_diff_threshold
-        self.death_dark_threshold = death_dark_threshold
-        self.cooldown_sec        = cooldown_sec
+        self.kill_dark_ratio   = kill_dark_ratio
+        self.kill_bright_ratio = kill_bright_ratio
+        self.cooldown_sec      = cooldown_sec
+        self.use_gpu           = use_gpu
 
-        self._prev_banner: np.ndarray | None = None
-        self._prev_death_mean: float | None  = None
+        self._banner_visible = False
+        self._last_kill_t    = -999.0
 
-        self._last_kill_t:  float = -999.0
-        self._last_death_t: float = -999.0
+    # -- stage 1: fast pre-filter ------------------------------------------
+    def _prefilter(self, gray_roi) -> bool:
+        thumb = cv2.resize(gray_roi, (100, 14), interpolation=cv2.INTER_AREA)
+        dark  = float((thumb < 60).sum()) / thumb.size
+        return dark >= self.kill_dark_ratio
 
-    # ── バナー検出 ────────────────────────────────────────────────────────────
-    def _detect_kill(self, frame: np.ndarray, t: float) -> MarkerEvent | None:
-        roi  = _crop_roi(frame, SPLATOON_ROIS["kill_banner"])
-        g    = _gray(roi)
-        small = cv2.resize(g, (160, 24))  # 解像度正規化
+    # -- stage 2a: easyocr -------------------------------------------------
+    def _ocr_has_kill_text(self, roi) -> bool:
+        reader = _ensure_reader(self.use_gpu)
+        if reader is None:
+            return False
+        # upscale for better recognition
+        gray = _gray(roi)
+        h, w = gray.shape
+        big  = cv2.resize(gray, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
+        _, thresh = cv2.threshold(big, 120, 255, cv2.THRESH_BINARY)
+        # easyocr accepts numpy arrays
+        try:
+            results = reader.readtext(thresh, detail=0, paragraph=True)
+            text    = " ".join(results)
+        except Exception:
+            return False
+        return any(p in text for p in KILL_PHRASES)
 
-        # 条件1: 暗部比率
-        dark_ratio = float((small < 50).sum()) / small.size
+    # -- stage 2b: pixel fallback ------------------------------------------
+    def _pixel_has_kill_text(self, gray_roi) -> bool:
+        thumb  = cv2.resize(gray_roi, (200, 28), interpolation=cv2.INTER_AREA)
+        bright = float((thumb > 160).sum()) / thumb.size
+        return bright >= self.kill_bright_ratio
 
-        # 条件2: 前フレームとの差分（バナー出現瞬間を捉える）
-        diff_mean = 0.0
-        if self._prev_banner is not None:
-            diff_mean = float(cv2.absdiff(small, self._prev_banner).mean())
+    # -- main entry --------------------------------------------------------
+    def feed(self, frame, time_sec: float) -> list:
+        roi  = _crop(frame, KILL_ROI)
+        gray = _gray(roi)
 
-        self._prev_banner = small.copy()
+        if not self._prefilter(gray):
+            self._banner_visible = False
+            return []
 
-        if dark_ratio >= self.kill_dark_ratio and diff_mean >= self.kill_diff_threshold:
-            if t - self._last_kill_t > self.cooldown_sec:
-                conf = min(1.0, dark_ratio * (diff_mean / 30.0))
-                self._last_kill_t = t
-                return MarkerEvent(t, "kill", round(conf, 3))
-        return None
+        if _EASYOCR:
+            banner_now = self._ocr_has_kill_text(roi)
+        else:
+            banner_now = self._pixel_has_kill_text(gray)
 
-    # ── デス検出 ──────────────────────────────────────────────────────────────
-    def _detect_death(self, frame: np.ndarray, t: float) -> MarkerEvent | None:
-        roi  = _crop_roi(frame, SPLATOON_ROIS["death_zone"])
-        mean = float(_gray(roi).mean())
+        result = []
+        if banner_now and not self._banner_visible:
+            if time_sec - self._last_kill_t > self.cooldown_sec:
+                self._last_kill_t = time_sec
+                result.append(MarkerEvent(time_sec, "kill", 1.0))
 
-        result = None
-        if self._prev_death_mean is not None:
-            drop = self._prev_death_mean - mean
-            if drop >= self.death_dark_threshold and mean < 35:
-                if t - self._last_death_t > self.cooldown_sec:
-                    conf = min(1.0, drop / 80.0)
-                    self._last_death_t = t
-                    result = MarkerEvent(t, "death", round(conf, 3))
-
-        self._prev_death_mean = mean
+        self._banner_visible = banner_now
         return result
 
-    # ── メイン ────────────────────────────────────────────────────────────────
-    def feed(self, frame: np.ndarray, time_sec: float) -> list[MarkerEvent]:
-        events: list[MarkerEvent] = []
-        kill = self._detect_kill(frame, time_sec)
-        if kill:
-            events.append(kill)
-        death = self._detect_death(frame, time_sec)
-        if death:
-            events.append(death)
-        return events
+
+# ---------------------------------------------------------------------------
+# GPU helpers
+# ---------------------------------------------------------------------------
+
+def check_gpu() -> dict:
+    info = {"cuda": False, "opencl": False, "label": "CPU only"}
+    try:
+        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            info["cuda"]  = True
+            info["label"] = "CUDA ({})".format(cv2.cuda.DeviceInfo(0).name())
+            return info
+    except Exception:
+        pass
+    try:
+        if cv2.ocl.haveOpenCL():
+            cv2.ocl.setUseOpenCL(True)
+            info["opencl"] = True
+            info["label"]  = "OpenCL ({})".format(cv2.ocl.Device.getDefault().name())
+    except Exception:
+        pass
+    return info
 
 
-def analyse_video(
-    path: str,
-    detector: SplatoonDetector,
-    sample_fps: float = 10.0,
-    progress_cb: Callable[[float], None] | None = None,
-) -> list[MarkerEvent]:
-    """
-    動画を sample_fps レートでフレームサンプリングして解析。
-    progress_cb(0.0~1.0) は定期的に呼ばれる。
-    """
+# ---------------------------------------------------------------------------
+# Analysis loop
+# ---------------------------------------------------------------------------
+
+def analyse_video(path, detector, sample_fps=10.0, progress_cb=None, use_gpu=False):
+    if use_gpu:
+        info = check_gpu()
+        if info["cuda"]:
+            try:
+                return _analyse_cuda(path, detector, sample_fps, progress_cb)
+            except Exception:
+                pass
+        if info["opencl"]:
+            cv2.ocl.setUseOpenCL(True)
+
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        raise IOError(f"Cannot open video: {path}")
+        raise IOError("Cannot open: " + path)
 
-    video_fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_step  = max(1, int(video_fps / sample_fps))
-
-    events: list[MarkerEvent] = []
-    frame_idx = 0
+    fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step   = max(1, int(fps / sample_fps))
+    idx    = 0
+    events = []
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        ok, frame = cap.read()
+        if not ok:
             break
-        if frame_idx % frame_step == 0:
-            t = frame_idx / video_fps
-            events.extend(detector.feed(frame, t))
-            if progress_cb and total_frames > 0:
-                progress_cb(frame_idx / total_frames)
-        frame_idx += 1
+        if idx % step == 0:
+            events.extend(detector.feed(frame, idx / fps))
+            if progress_cb and total > 0:
+                progress_cb(idx / total)
+        idx += 1
 
     cap.release()
+    if progress_cb:
+        progress_cb(1.0)
+    return events
+
+
+def _analyse_cuda(path, detector, sample_fps, progress_cb):
+    reader  = cv2.cudacodec.createVideoReader(path)
+    fmt     = reader.format()
+    fps     = fmt.fps if fmt.fps > 0 else 30.0
+    total   = getattr(fmt, "nFrames", 0)
+    step    = max(1, int(fps / sample_fps))
+    idx     = 0
+    events  = []
+    gpu_mat = cv2.cuda_GpuMat()
+
+    while True:
+        ok, gpu_mat = reader.nextFrame(gpu_mat)
+        if not ok:
+            break
+        if idx % step == 0:
+            frame = gpu_mat.download()
+            events.extend(detector.feed(frame, idx / fps))
+            if progress_cb and total > 0:
+                progress_cb(idx / total)
+        idx += 1
+
     if progress_cb:
         progress_cb(1.0)
     return events

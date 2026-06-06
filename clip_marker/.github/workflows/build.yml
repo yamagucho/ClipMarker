@@ -1,0 +1,59 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags:     ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --noconsole --name "ClipMarker" --icon=icon.ico app.py
+
+      - name: Upload artifact (every push)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipMarker-Windows
+          path: dist/ClipMarker.exe
+
+      - name: Create GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ClipMarker ${{ github.ref_name }}"
+          body: |
+            ## ClipMarker ${{ github.ref_name }}
+
+            ### インストール方法
+            1. `ClipMarker.exe` をダウンロード
+            2. 同じフォルダに `easyocr` が必要な場合は `pip install easyocr` を実行
+            3. 音声再生には ffmpeg が必要です（https://ffmpeg.org）
+
+            ### 動作環境
+            - Windows 10 / 11
+            - Splatoon 2 / 3 録画ファイル（MP4, MKV, MOV など）
+
+            ### 主な機能
+            - 「をたおした！」バナーを自動検出してキルマーカーを付与（EasyOCR使用）
+            - 動画プレイヤー内蔵（等倍再生・音声対応）
+            - マーカー付きシークバー
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          files: dist/ClipMarker.exe
