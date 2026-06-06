@@ -7,10 +7,15 @@ build/
 __pycache__/
 *.py[cod]
 *.pyo
-*.egg-info/
 .eggs/
 venv/
 .venv/
+
+# Developer tools (not for end users)
+release.bat
+github_sync.bat
+build_windows.bat
+ClipMarker.bat
 
 # OS
 .DS_Store
