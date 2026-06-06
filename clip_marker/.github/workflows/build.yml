@@ -24,8 +24,14 @@ jobs:
           pip install pyinstaller
 
       - name: Build EXE
-        run: |
-          pyinstaller --onefile --noconsole --name "ClipMarker" --icon=icon.ico app.py
+        run: >
+          pyinstaller --onefile --noconsole --name "ClipMarker" --icon=icon.ico
+          --collect-all easyocr
+          --collect-all torchvision
+          --hidden-import=easyocr
+          --hidden-import=pygame
+          --hidden-import=cv2
+          app.py
 
       - name: Upload artifact (every push)
         uses: actions/upload-artifact@v4
@@ -41,19 +47,22 @@ jobs:
           body: |
             ## ClipMarker ${{ github.ref_name }}
 
-            ### インストール方法
-            1. `ClipMarker.exe` をダウンロード
-            2. 同じフォルダに `easyocr` が必要な場合は `pip install easyocr` を実行
-            3. 音声再生には ffmpeg が必要です（https://ffmpeg.org）
+            ### 使い方
+            1. `ClipMarker.exe` をダウンロードして起動
+            2. 動画ファイルを開いて「Start Analysis」を押すだけ
+            3. **初回起動時のみ** OCR用モデルを自動ダウンロード（約100MB・1回のみ）
 
             ### 動作環境
-            - Windows 10 / 11
-            - Splatoon 2 / 3 録画ファイル（MP4, MKV, MOV など）
+            - Windows 10 / 11 (64bit)
+            - 追加インストール不要
+
+            ### オプション
+            - 音声再生には ffmpeg が必要です → https://ffmpeg.org
 
             ### 主な機能
-            - 「をたおした！」バナーを自動検出してキルマーカーを付与（EasyOCR使用）
+            - 「をたおした！」バナーをOCRで自動検出してキルマーカーを付与
             - 動画プレイヤー内蔵（等倍再生・音声対応）
-            - マーカー付きシークバー
+            - マーカー付きシークバー・キーボードショートカット
           draft: false
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
           files: dist/ClipMarker.exe
