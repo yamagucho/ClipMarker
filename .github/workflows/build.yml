@@ -6,6 +6,9 @@ on:
     tags:     ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -27,11 +30,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ClipMarker-Windows
-          path: dist/ClipMarker.exe
+          path: clip_marker/dist/ClipMarker.exe
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           name: "ClipMarker ${{ github.ref_name }}"
           prerelease: ${{ contains(github.ref_name, 'beta') }}
-          files: dist/ClipMarker.exe
+          files: clip_marker/dist/ClipMarker.exe
